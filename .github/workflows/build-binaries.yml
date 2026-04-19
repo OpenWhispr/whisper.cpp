@@ -463,8 +463,149 @@ jobs:
           name: whisper-server-linux-x64-cuda
           path: dist/whisper-server-linux-x64-cuda.zip
 
+  build-linux-x64-vulkan:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake wget gnupg
+
+      - name: Install Vulkan SDK
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/lunarg.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/lunarg.gpg] https://packages.lunarg.com/vulkan jammy main" \
+            | sudo tee /etc/apt/sources.list.d/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Verify Vulkan SDK
+        run: |
+          echo "VULKAN_SDK=${VULKAN_SDK}"
+          glslc --version
+          dpkg -l | grep -E 'vulkan|shaderc' || true
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-x64-vulkan
+
+      - name: Build whisper.cpp with Vulkan
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_VULKAN=ON
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp build/bin/whisper-server dist/whisper-server-linux-x64-vulkan
+          chmod +x dist/whisper-server-linux-x64-vulkan
+          cd dist
+          zip whisper-server-linux-x64-vulkan.zip whisper-server-linux-x64-vulkan
+
+      - name: Upload whisper-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-linux-x64-vulkan
+          path: dist/whisper-server-linux-x64-vulkan.zip
+
+  build-windows-x64-vulkan:
+    runs-on: windows-2022
+    steps:
+      - name: Free up disk space
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\CodeQL" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\Java*" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\go" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\Python" -ErrorAction SilentlyContinue
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Vulkan SDK
+        uses: jakoch/install-vulkan-sdk-action@v1.2.0
+        with:
+          vulkan_version: 1.3.290.0
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      - name: Verify Vulkan SDK
+        shell: pwsh
+        run: |
+          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
+          & "$env:VULKAN_SDK\Bin\glslc.exe" --version
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: windows-x64-vulkan
+          variant: sccache
+
+      - name: Build whisper.cpp with Vulkan
+        shell: cmd
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_VULKAN=ON ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package binary
+        shell: pwsh
+        run: |
+          mkdir dist
+          Copy-Item build\bin\Release\whisper-server.exe dist\whisper-server-win32-x64-vulkan.exe
+
+          # vulkan-1.dll is provided by the user's GPU driver install — do not bundle.
+          # whisper-server is statically linked against ggml-vulkan, so no other runtime DLLs are needed.
+
+          Write-Host "Contents of dist folder:"
+          Get-ChildItem dist | Format-Table Name, Length
+
+          Set-Location dist
+          Compress-Archive -Path whisper-server-win32-x64-vulkan.exe -DestinationPath whisper-server-win32-x64-vulkan.zip
+
+      - name: Upload whisper-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-win32-x64-vulkan
+          path: dist/whisper-server-win32-x64-vulkan.zip
+
   create-release:
-    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-linux-x64-cpu, build-linux-x64-cuda]
+    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-windows-x64-vulkan, build-linux-x64-cpu, build-linux-x64-cuda, build-linux-x64-vulkan]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -487,6 +628,8 @@ jobs:
           mv artifacts/whisper-server-win32-x64-cuda/whisper-server-win32-x64-cuda.zip release/
           mv artifacts/whisper-server-linux-x64-cpu/whisper-server-linux-x64-cpu.zip release/
           mv artifacts/whisper-server-linux-x64-cuda/whisper-server-linux-x64-cuda.zip release/
+          mv artifacts/whisper-server-win32-x64-vulkan/whisper-server-win32-x64-vulkan.zip release/
+          mv artifacts/whisper-server-linux-x64-vulkan/whisper-server-linux-x64-vulkan.zip release/
           ls -la release/
 
       - name: Determine version
@@ -504,12 +647,12 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: OpenWhispr Binaries ${{ steps.version.outputs.version }}
           body: |
-            Pre-built whisper.cpp binaries for OpenWhispr. CPU and CUDA variants are included.
+            Pre-built whisper.cpp binaries for OpenWhispr. CPU, CUDA, and Vulkan variants are included.
 
             ## GPU Acceleration
             - **macOS ARM64**: Metal GPU acceleration (M1/M2/M3/M4)
-            - **Windows x64**: NVIDIA CUDA build (bundled DLLs) and CPU build
-            - **Linux x64**: NVIDIA CUDA build (requires system CUDA) and CPU build
+            - **Windows x64**: NVIDIA CUDA build (bundled DLLs), Vulkan build (any Vulkan-capable GPU), and CPU build
+            - **Linux x64**: NVIDIA CUDA build (requires system CUDA), Vulkan build (any Vulkan-capable GPU), and CPU build
             - **macOS x64**: CPU only (Intel Macs)
 
             ## whisper-cli binaries
@@ -525,17 +668,21 @@ jobs:
             - `whisper-server-darwin-x64.zip` - macOS Intel (CPU only)
             - `whisper-server-win32-x64-cpu.zip` - Windows x64 CPU-only
             - `whisper-server-win32-x64-cuda.zip` - Windows x64 with CUDA (includes bundled CUDA DLLs)
+            - `whisper-server-win32-x64-vulkan.zip` - Windows x64 with Vulkan (uses system Vulkan loader)
             - `whisper-server-linux-x64-cpu.zip` - Linux x64 CPU-only
             - `whisper-server-linux-x64-cuda.zip` - Linux x64 with CUDA
+            - `whisper-server-linux-x64-vulkan.zip` - Linux x64 with Vulkan (uses system Vulkan loader)
 
             ## Requirements
             - **Windows CUDA build**: No additional requirements - CUDA DLLs are bundled.
+            - **Windows Vulkan build**: Requires an up-to-date GPU driver that ships the Vulkan runtime (`vulkan-1.dll`). All modern NVIDIA/AMD/Intel drivers include it.
             - **Windows CPU build**: No requirements.
             - **Linux CUDA build**: Install latest NVIDIA drivers and CUDA toolkit for GPU acceleration.
+            - **Linux Vulkan build**: Requires the system Vulkan loader (`libvulkan.so.1`, typically from the `libvulkan1` package) and a Vulkan-capable GPU driver (Mesa for AMD/Intel, NVIDIA proprietary driver for NVIDIA).
             - **Linux CPU build**: No requirements.
             - **All other platforms**: No requirements.
 
-            ## Supported NVIDIA GPUs
+            ## Supported NVIDIA GPUs (CUDA builds)
             Compute capabilities 7.5+ (RTX 2000 series through RTX 40 series)
           files: release/*
           draft: false
