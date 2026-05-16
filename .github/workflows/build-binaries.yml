@@ -75,12 +75,18 @@ jobs:
           key: macos-x64
 
       - name: Build whisper.cpp for x64
+        # Without CMAKE_OSX_DEPLOYMENT_TARGET, CMake picks the runner's SDK
+        # default (macOS 14 on the macos-14 runner). The linker then writes
+        # references to the $NEWLAPACK$ILP64 Accelerate symbols introduced
+        # in macOS 13.3, breaking the binary on Monterey 12.x.
+        # See OpenWhispr/openwhispr#764.
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DWHISPER_METAL=OFF \
             -DGGML_METAL=OFF \
             -DGGML_NATIVE=OFF \
