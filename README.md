@@ -7,7 +7,7 @@
 [![Conan Center](https://shields.io/conan/v/whisper-cpp)](https://conan.io/center/whisper-cpp)
 [![npm](https://img.shields.io/npm/v/whisper.cpp.svg)](https://www.npmjs.com/package/whisper.cpp/)
 
-Stable: [v1.8.1](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.8.1) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
+Stable: [v1.9.1](https://github.com/ggml-org/whisper.cpp/releases/tag/v1.9.1) / [Roadmap](https://github.com/orgs/ggml-org/projects/4/)
 
 High-performance inference of [OpenAI's Whisper](https://github.com/openai/whisper) automatic speech recognition (ASR) model:
 
@@ -21,6 +21,7 @@ High-performance inference of [OpenAI's Whisper](https://github.com/openai/whisp
 - [Vulkan support](#vulkan-gpu-support)
 - Support for CPU-only inference
 - [Efficient GPU support for NVIDIA](#nvidia-gpu-support)
+- [AMD ROCm GPU support](#amd-rocm-gpu-support)
 - [OpenVINO Support](#openvino-support)
 - [Ascend NPU Support](#ascend-npu-support)
 - [Moore Threads GPU Support](#moore-threads-gpu-support)
@@ -340,6 +341,27 @@ cmake -B build -DGGML_VULKAN=1
 cmake --build build -j --config Release
 ```
 
+## AMD ROCm GPU support
+
+With AMD GPUs the processing can be accelerated via HIP/ROCm.
+First, make sure you have installed [ROCm](https://rocm.docs.amd.com/en/latest/).
+
+Now build `whisper.cpp` with HIP support:
+
+```
+cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS="gfx1201"
+cmake --build build -j --config Release
+```
+
+Replace `gfx1201` with your GPU architecture. You can find it with:
+
+```
+rocminfo | grep "gfx"
+```
+
+Common architectures: `gfx1100` (RX 7900 XTX), `gfx1101` (RX 7800 XT), `gfx1201` (RX 9070 XT).
+For multiple GPUs with different architectures: `-DAMDGPU_TARGETS="gfx1100;gfx1201"`.
+
 ## BLAS CPU support via OpenBLAS
 
 Encoder processing can be accelerated on the CPU via OpenBLAS.
@@ -403,9 +425,10 @@ cmake -B build -DGGML_MUSA=1 -DMUSA_ARCHITECTURES="21"
 cmake --build build -j --config Release
 ```
 
-## FFmpeg support (Linux only)
+## FFmpeg support (examples only)
 
-If you want to support more audio formats (such as Opus and AAC), you can turn on the `WHISPER_FFMPEG` build flag to enable FFmpeg integration.
+By default, the examples in this repo use the [miniaudio](https://github.com/mackron/miniaudio) library to decode audio files.
+Some of the examples also can use FFmpeg for decoding and broader format support. To enable that, build with `WHISPER_COMMON_FFMPEG`.
 
 First, you need to install required libraries:
 
@@ -420,7 +443,7 @@ sudo dnf install libavcodec-free-devel libavformat-free-devel libavutil-free-dev
 Then you can build the project as follows:
 
 ```bash
-cmake -B build -D WHISPER_FFMPEG=yes
+cmake -B build -D WHISPER_COMMON_FFMPEG=yes
 cmake --build build
 ```
 
@@ -443,11 +466,12 @@ ffmpeg -i samples/jfk.wav jfk.opus
 
 ### Images
 
-We have two Docker images available for this project:
+We have multiple Docker images available for this project:
 
 1. `ghcr.io/ggml-org/whisper.cpp:main`: This image includes the main executable file as well as `curl` and `ffmpeg`. (platforms: `linux/amd64`, `linux/arm64`)
 2. `ghcr.io/ggml-org/whisper.cpp:main-cuda`: Same as `main` but compiled with CUDA support. (platforms: `linux/amd64`)
 3. `ghcr.io/ggml-org/whisper.cpp:main-musa`: Same as `main` but compiled with MUSA support. (platforms: `linux/amd64`)
+4. `ghcr.io/ggml-org/whisper.cpp:main-vulkan`: Same as `main` but compiled with Vulkan support. (platforms: `linux/amd64`)
 
 ### Usage
 
@@ -456,15 +480,27 @@ We have two Docker images available for this project:
 docker run -it --rm \
   -v path/to/models:/models \
   whisper.cpp:main "./models/download-ggml-model.sh base /models"
+
 # transcribe an audio file
 docker run -it --rm \
   -v path/to/models:/models \
   -v path/to/audios:/audios \
   whisper.cpp:main "whisper-cli -m /models/ggml-base.bin -f /audios/jfk.wav"
+
 # transcribe an audio file in samples folder
 docker run -it --rm \
   -v path/to/models:/models \
   whisper.cpp:main "whisper-cli -m /models/ggml-base.bin -f ./samples/jfk.wav"
+
+# run the web server
+docker run -it --rm -p "8080:8080" \
+  -v path/to/models:/models \
+  whisper.cpp:main "whisper-server --host 127.0.0.1 -m /models/ggml-base.bin"
+  
+# run the bench too on the small.en model using 4 threads
+docker run -it --rm \
+  -v path/to/models:/models \
+  whisper.cpp:main "whisper-bench -m /models/ggml-small.en.bin -t 4"
 ```
 
 ## Installing with Conan
@@ -742,7 +778,7 @@ argument to `whisper-cli`. In addition to this option a VAD model is also
 required.
 
 The way this works is that first the audio samples are passed through
-the VAD model which will detect speech segments. Using this information the
+the VAD model which will detect speech segments. Using this information,
 only the speech segments that are detected are extracted from the original audio
 input and passed to whisper for processing. This reduces the amount of audio
 data that needs to be processed by whisper and can significantly speed up the
