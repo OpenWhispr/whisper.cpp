@@ -561,12 +561,15 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1.2.0
-        with:
-          vulkan_version: 1.3.290.0
-          install_runtime: true
-          cache: true
-          stripdown: true
+        shell: pwsh
+        # SDK 1.4.313.2 ships SPIRV-HeadersConfig.cmake, which ggml-vulkan's
+        # find_package(SPIRV-Headers CONFIG REQUIRED) needs; 1.3.290.0 did not.
+        # Matches llama.cpp's proven Windows Vulkan recipe (direct LunarG installer).
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP/VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/1.4.313.2/windows/vulkansdk-windows-X64-1.4.313.2.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\1.4.313.2"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\1.4.313.2\Bin"
 
       - name: Verify Vulkan SDK
         shell: pwsh
