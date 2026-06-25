@@ -1,4 +1,3 @@
-#include <ruby.h>
 #include "ruby_whisper.h"
 #include "common-whisper.h"
 #include <string>
@@ -13,10 +12,30 @@ extern const rb_data_type_t ruby_whisper_params_type;
 
 extern ID id_to_s;
 extern ID id_call;
+extern ID id_to_path;
 extern ID transcribe_option_names[1];
 
-extern void
-prepare_transcription(ruby_whisper_params * rwp, VALUE * self);
+extern void prepare_transcription(ruby_whisper_params * rwp, VALUE * self, int n_processors);
+extern VALUE full_body(VALUE rb_args);
+extern VALUE full_parallel_body(VALUE rb_args);
+
+typedef struct{
+  struct whisper_context *context;
+  struct whisper_full_params *params;
+  float *samples;
+  size_t n_samples;
+  int n_processors;
+  int result;
+} transcribe_without_gvl_args;
+
+static void*
+transcribe_without_gvl(void *rb_args)
+{
+  transcribe_without_gvl_args *args = (transcribe_without_gvl_args *)rb_args;
+  args->result = whisper_full_parallel(args->context, *args->params, args->samples, args->n_samples, args->n_processors);
+
+  return NULL;
+}
 
 /*
  * transcribe a single file
@@ -50,6 +69,9 @@ ruby_whisper_transcribe(int argc, VALUE *argv, VALUE self) {
     rb_raise(rb_eRuntimeError, "Expected file path to wave file");
   }
 
+  if (rb_respond_to(wave_file_path, id_to_path)) {
+    wave_file_path = rb_funcall(wave_file_path, id_to_path, 0);
+  }
   std::string fname_inp = StringValueCStr(wave_file_path);
 
   std::vector<float> pcmf32; // mono-channel F32 PCM
@@ -59,20 +81,28 @@ ruby_whisper_transcribe(int argc, VALUE *argv, VALUE self) {
     fprintf(stderr, "error: failed to open '%s' as WAV file\n", fname_inp.c_str());
     return self;
   }
-  // Commented out because it is work in progress
-  // {
-  //   static bool is_aborted = false; // NOTE: this should be atomic to avoid data race
 
-  //   rwp->params.encoder_begin_callback = [](struct whisper_context * /*ctx*/, struct whisper_state * /*state*/, void * user_data) {
-  //     bool is_aborted = *(bool*)user_data;
-  //     return !is_aborted;
-  //   };
-  //   rwp->params.encoder_begin_callback_user_data = &is_aborted;
-  // }
-
-  prepare_transcription(rwp, &self);
-
-  if (whisper_full_parallel(rw->context, rwp->params, pcmf32.data(), pcmf32.size(), n_processors) != 0) {
+  VALUE rb_result;
+  if (n_processors == 1) {
+    ruby_whisper_full_args args = {
+      &self,
+      &params,
+      pcmf32.data(),
+      (int)pcmf32.size(),
+    };
+    rb_result = full_body((VALUE)&args);
+  } else {
+    ruby_whisper_full_parallel_args parallel_args = {
+      &self,
+      &params,
+      pcmf32.data(),
+      (int)pcmf32.size(),
+      n_processors,
+    };
+    rb_result = full_parallel_body((VALUE)&parallel_args);
+  }
+  const int result = NUM2INT(rb_result);
+  if (result != 0) {
     fprintf(stderr, "failed to process audio\n");
     return self;
   }
