@@ -30,11 +30,15 @@ jobs:
           key: macos-arm64
 
       - name: Build whisper.cpp
+        # Same Accelerate $NEWLAPACK$ILP64 issue as the x64 job: the arm64
+        # binary links Accelerate too (Metal does not replace BLAS), so without
+        # an explicit target it also fails on macOS < 13.3. See OpenWhispr/openwhispr#764.
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
             -DWHISPER_METAL=ON \
             -DGGML_METAL=ON \
             -DBUILD_SHARED_LIBS=OFF
