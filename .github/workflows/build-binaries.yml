@@ -31,15 +31,16 @@ jobs:
           key: macos-arm64
 
       - name: Build whisper.cpp
-        # Same Accelerate $NEWLAPACK$ILP64 issue as the x64 job: the arm64
-        # binary links Accelerate too (Metal does not replace BLAS), so without
-        # an explicit target it also fails on macOS < 13.3. See OpenWhispr/openwhispr#764.
+        # GGML_BLAS=OFF: ggml-blas imports $NEWLAPACK$ILP64 Accelerate symbols that
+        # don't exist before macOS 13.3, and Metal runs the graph on arm64 so BLAS
+        # is idle. Keeps Monterey (12.x) working. See OpenWhispr/openwhispr#764.
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DGGML_BLAS=OFF \
             -DWHISPER_METAL=ON \
             -DGGML_METAL=ON \
             -DBUILD_SHARED_LIBS=OFF
@@ -55,6 +56,13 @@ jobs:
           cd dist
           zip whisper-cpp-darwin-arm64.zip whisper-cpp-darwin-arm64
           zip whisper-server-darwin-arm64.zip whisper-server-darwin-arm64
+
+      - name: Verify deployment target and symbols
+        run: |
+          for bin in dist/whisper-cpp-darwin-arm64 dist/whisper-server-darwin-arm64; do
+            otool -l "$bin" | grep -A2 LC_BUILD_VERSION | grep -q 'minos 12.0' || { echo "$bin: expected minos 12.0"; exit 1; }
+            if nm -u "$bin" | grep -q 'NEWLAPACK'; then echo "$bin: imports \$NEWLAPACK\$ILP64 but targets macOS < 13.3"; exit 1; fi
+          done
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -80,18 +88,16 @@ jobs:
           key: macos-x64
 
       - name: Build whisper.cpp for x64
-        # Without CMAKE_OSX_DEPLOYMENT_TARGET, CMake picks the runner's SDK
-        # default (macOS 14 on the macos-14 runner). The linker then writes
-        # references to the $NEWLAPACK$ILP64 Accelerate symbols introduced
-        # in macOS 13.3, breaking the binary on Monterey 12.x.
-        # See OpenWhispr/openwhispr#764.
+        # 13.3 floor matches upstream llama.cpp/whisper.cpp releases: ggml-blas
+        # (Accelerate GEMM, worth keeping on CPU-only x64) imports $NEWLAPACK$ILP64
+        # symbols that only exist on macOS >= 13.3. See OpenWhispr/openwhispr#764.
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
             -DWHISPER_METAL=OFF \
             -DGGML_METAL=OFF \
             -DGGML_NATIVE=OFF \
@@ -108,6 +114,12 @@ jobs:
           cd dist
           zip whisper-cpp-darwin-x64.zip whisper-cpp-darwin-x64
           zip whisper-server-darwin-x64.zip whisper-server-darwin-x64
+
+      - name: Verify deployment target
+        run: |
+          for bin in dist/whisper-cpp-darwin-x64 dist/whisper-server-darwin-x64; do
+            otool -l "$bin" | grep -A2 LC_BUILD_VERSION | grep -q 'minos 13.3' || { echo "$bin: expected minos 13.3"; exit 1; }
+          done
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -667,7 +679,7 @@ jobs:
             - **macOS ARM64**: Metal GPU acceleration (M1/M2/M3/M4)
             - **Windows x64**: NVIDIA CUDA build (bundled DLLs), Vulkan build (any Vulkan-capable GPU), and CPU build
             - **Linux x64**: NVIDIA CUDA build (requires system CUDA), Vulkan build (any Vulkan-capable GPU), and CPU build
-            - **macOS x64**: CPU only (Intel Macs)
+            - **macOS x64**: CPU only (Intel Macs, requires macOS 13.3+)
 
             ## whisper-cli binaries
             - `whisper-cpp-darwin-arm64.zip` - macOS Apple Silicon with Metal
