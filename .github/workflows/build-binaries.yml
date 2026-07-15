@@ -60,7 +60,8 @@ jobs:
       - name: Verify deployment target and symbols
         run: |
           for bin in dist/whisper-cpp-darwin-arm64 dist/whisper-server-darwin-arm64; do
-            otool -l "$bin" | grep -A2 LC_BUILD_VERSION | grep -q 'minos 12.0' || { echo "$bin: expected minos 12.0"; exit 1; }
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            [ "$minos" = "12.0" ] || { echo "$bin: expected minos 12.0, got $minos"; exit 1; }
             if nm -u "$bin" | grep -q 'NEWLAPACK'; then echo "$bin: imports \$NEWLAPACK\$ILP64 but targets macOS < 13.3"; exit 1; fi
           done
 
@@ -118,7 +119,8 @@ jobs:
       - name: Verify deployment target
         run: |
           for bin in dist/whisper-cpp-darwin-x64 dist/whisper-server-darwin-x64; do
-            otool -l "$bin" | grep -A2 LC_BUILD_VERSION | grep -q 'minos 13.3' || { echo "$bin: expected minos 13.3"; exit 1; }
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+            [ "$minos" = "13.3" ] || { echo "$bin: expected minos 13.3, got $minos"; exit 1; }
           done
 
       - name: Upload whisper-cli artifact
