@@ -15,8 +15,11 @@ permissions:
   contents: write
 
 env:
-  # RTX 20-50 (Turing through Blackwell). sm_120 requires CUDA Toolkit >= 12.8.
-  CUDA_ARCHITECTURES: "75;80;86;89;120"
+  # GTX 10 series through RTX 50 (Pascal through Blackwell). sm_120 requires
+  # CUDA Toolkit >= 12.8. Without sm_61 the server loads the model on a Pascal
+  # card and aborts at the first kernel launch ("no kernel image is available");
+  # 61's embedded PTX also covers Volta (sm_70) via driver JIT.
+  CUDA_ARCHITECTURES: "61;75;80;86;89;120"
 
 jobs:
   build-macos-arm64:
@@ -711,7 +714,7 @@ jobs:
             - **All other platforms**: No requirements.
 
             ## Supported NVIDIA GPUs (CUDA builds)
-            Compute capabilities 7.5+ (RTX 2000 series through RTX 40 series)
+            Compute capabilities 6.1+ (GTX 10 series and newer)
           files: release/*
           draft: false
           prerelease: false
