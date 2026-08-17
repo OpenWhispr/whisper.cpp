@@ -184,9 +184,37 @@ jobs:
           mkdir dist
           Copy-Item build\bin\Release\whisper-cli.exe dist\whisper-cpp-win32-x64-cpu.exe
           Copy-Item build\bin\Release\whisper-server.exe dist\whisper-server-win32-x64-cpu.exe
+
+          # Both exes link the dynamic MSVC runtime: CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          # is a silent no-op while CMake policy CMP0091 is unset, and MSVC OpenMP links
+          # vcomp140.dll dynamically regardless. On a machine without the VC++ 2015-2022
+          # redistributable the loader kills a bare exe with 0xC0000135 (STATUS_DLL_NOT_FOUND)
+          # before main(), so ship the runtime app-locally (OpenWhispr CUS-113). Glob the
+          # toolset dir (Microsoft.VC143.* today) — the version moves with the runner image.
+          $crt = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT" | Select-Object -First 1).FullName
+          $omp = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.OpenMP" | Select-Object -First 1).FullName
+          $runtimeDlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+          foreach ($dll in $runtimeDlls) { Copy-Item (Join-Path $crt $dll) dist\ }
+          Copy-Item (Join-Path $omp "vcomp140.dll") dist\
+          $runtimeDlls += "vcomp140.dll"
+
           Set-Location dist
-          Compress-Archive -Path whisper-cpp-win32-x64-cpu.exe -DestinationPath whisper-cpp-win32-x64-cpu.zip
-          Compress-Archive -Path whisper-server-win32-x64-cpu.exe -DestinationPath whisper-server-win32-x64-cpu.zip
+          Compress-Archive -Path (@("whisper-cpp-win32-x64-cpu.exe") + $runtimeDlls) -DestinationPath whisper-cpp-win32-x64-cpu.zip
+          Compress-Archive -Path (@("whisper-server-win32-x64-cpu.exe") + $runtimeDlls) -DestinationPath whisper-server-win32-x64-cpu.zip
+
+      - name: Verify zips contain the MSVC runtime DLLs
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $required = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll")
+          foreach ($zip in Get-ChildItem dist\*.zip) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+            $names = $archive.Entries.Name
+            $archive.Dispose()
+            Write-Host "$($zip.Name): $($names -join ', ')"
+            $missing = $required | Where-Object { $names -notcontains $_ }
+            if ($missing) { throw "$($zip.Name) missing: $($missing -join ', ')" }
+          }
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -329,6 +357,16 @@ jobs:
             exit 1
           }
 
+          # MSVC runtime DLLs — the exes link the dynamic CRT; see the CPU job comment.
+          $crt = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT" | Select-Object -First 1).FullName
+          $omp = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.OpenMP" | Select-Object -First 1).FullName
+          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            Copy-Item (Join-Path $crt $dll) dist\
+            $bundledDlls += $dll
+          }
+          Copy-Item (Join-Path $omp "vcomp140.dll") dist\
+          $bundledDlls += "vcomp140.dll"
+
           # Create zip archives with dynamically built file lists
           Set-Location dist
           $cliFiles = @("whisper-cpp-win32-x64-cuda.exe") + $bundledDlls
@@ -336,6 +374,20 @@ jobs:
 
           Compress-Archive -Path $cliFiles -DestinationPath whisper-cpp-win32-x64-cuda.zip
           Compress-Archive -Path $serverFiles -DestinationPath whisper-server-win32-x64-cuda.zip
+
+      - name: Verify zips contain the MSVC runtime DLLs
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $required = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll")
+          foreach ($zip in Get-ChildItem dist\*.zip) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+            $names = $archive.Entries.Name
+            $archive.Dispose()
+            Write-Host "$($zip.Name): $($names -join ', ')"
+            $missing = $required | Where-Object { $names -notcontains $_ }
+            if ($missing) { throw "$($zip.Name) missing: $($missing -join ', ')" }
+          }
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -621,13 +673,34 @@ jobs:
           Copy-Item build\bin\Release\whisper-server.exe dist\whisper-server-win32-x64-vulkan.exe
 
           # vulkan-1.dll is provided by the user's GPU driver install — do not bundle.
-          # whisper-server is statically linked against ggml-vulkan, so no other runtime DLLs are needed.
+          # whisper-server is statically linked against ggml-vulkan, but the exe still
+          # links the dynamic MSVC runtime; bundle it — see the CPU job comment.
+          $crt = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT" | Select-Object -First 1).FullName
+          $omp = (Get-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.OpenMP" | Select-Object -First 1).FullName
+          $runtimeDlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+          foreach ($dll in $runtimeDlls) { Copy-Item (Join-Path $crt $dll) dist\ }
+          Copy-Item (Join-Path $omp "vcomp140.dll") dist\
+          $runtimeDlls += "vcomp140.dll"
 
           Write-Host "Contents of dist folder:"
           Get-ChildItem dist | Format-Table Name, Length
 
           Set-Location dist
-          Compress-Archive -Path whisper-server-win32-x64-vulkan.exe -DestinationPath whisper-server-win32-x64-vulkan.zip
+          Compress-Archive -Path (@("whisper-server-win32-x64-vulkan.exe") + $runtimeDlls) -DestinationPath whisper-server-win32-x64-vulkan.zip
+
+      - name: Verify zip contains the MSVC runtime DLLs
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $required = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll")
+          foreach ($zip in Get-ChildItem dist\*.zip) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($zip.FullName)
+            $names = $archive.Entries.Name
+            $archive.Dispose()
+            Write-Host "$($zip.Name): $($names -join ', ')"
+            $missing = $required | Where-Object { $names -notcontains $_ }
+            if ($missing) { throw "$($zip.Name) missing: $($missing -join ', ')" }
+          }
 
       - name: Upload whisper-server artifact
         uses: actions/upload-artifact@v4
@@ -705,9 +778,9 @@ jobs:
             - `whisper-server-linux-x64-vulkan.zip` - Linux x64 with Vulkan (uses system Vulkan loader)
 
             ## Requirements
-            - **Windows CUDA build**: No additional requirements - CUDA DLLs are bundled.
-            - **Windows Vulkan build**: Requires an up-to-date GPU driver that ships the Vulkan runtime (`vulkan-1.dll`). All modern NVIDIA/AMD/Intel drivers include it.
-            - **Windows CPU build**: No requirements.
+            - **Windows CUDA build**: No additional requirements - CUDA and MSVC runtime DLLs are bundled.
+            - **Windows Vulkan build**: Requires an up-to-date GPU driver that ships the Vulkan runtime (`vulkan-1.dll`). All modern NVIDIA/AMD/Intel drivers include it. MSVC runtime DLLs are bundled.
+            - **Windows CPU build**: No requirements - MSVC runtime DLLs are bundled.
             - **Linux CUDA build**: Install latest NVIDIA drivers and CUDA toolkit for GPU acceleration.
             - **Linux Vulkan build**: Requires the system Vulkan loader (`libvulkan.so.1`, typically from the `libvulkan1` package) and a Vulkan-capable GPU driver (Mesa for AMD/Intel, NVIDIA proprietary driver for NVIDIA).
             - **Linux CPU build**: No requirements.
