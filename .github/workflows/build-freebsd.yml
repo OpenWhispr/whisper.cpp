@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   freeBSD-latest:
-    runs-on: macos-13
+    runs-on: macos-15-intel
 
     steps:
       - name: Clone
