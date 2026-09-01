@@ -464,8 +464,11 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
             -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
-            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}"
+            -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHITECTURES }}" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
           cmake --build build --config Release -j $(nproc)
 
       - name: Package binaries
@@ -475,9 +478,29 @@ jobs:
           chmod +x dist/whisper-cpp-linux-x64-cuda
           cp build/bin/whisper-server dist/whisper-server-linux-x64-cuda
           chmod +x dist/whisper-server-linux-x64-cuda
+          cp -L /usr/local/cuda-12.9/lib64/libcudart.so.12 dist/
+          cp -L /usr/local/cuda-12.9/lib64/libcublas.so.12 dist/
+          cp -L /usr/local/cuda-12.9/lib64/libcublasLt.so.12 dist/
+          cp /usr/local/cuda-12.9/EULA.txt dist/CUDA-12.9-LICENSE.txt
+
+      - name: Verify Linux CUDA package
+        run: |
+          unset LD_LIBRARY_PATH
+          for bin in dist/whisper-cpp-linux-x64-cuda dist/whisper-server-linux-x64-cuda; do
+            readelf -d "$bin" | grep -Eq 'RUNPATH.*\[\$ORIGIN\]' || { echo "$bin: RUNPATH is not \$ORIGIN"; exit 1; }
+            readelf -d "$bin" | grep -Eq 'NEEDED.*\[libcuda.so.1\]' || { echo "$bin: NVIDIA driver dependency is missing"; exit 1; }
+            deps=$(ldd "$bin")
+            printf '%s\n' "$deps" | grep -Eq 'libcudart.so.12 => .*/dist/libcudart.so.12' || { echo "$bin: libcudart is not bundled"; exit 1; }
+            printf '%s\n' "$deps" | grep -Eq 'libcublas.so.12 => .*/dist/libcublas.so.12' || { echo "$bin: cuBLAS is not bundled"; exit 1; }
+            test -z "$(printf '%s\n' "$deps" | awk '/not found/ && $1 != "libcuda.so.1" { print $1 })"
+          done
+          test ! -e dist/libcuda.so.1
+
+      - name: Create Linux CUDA archives
+        run: |
           cd dist
-          zip whisper-cpp-linux-x64-cuda.zip whisper-cpp-linux-x64-cuda
-          zip whisper-server-linux-x64-cuda.zip whisper-server-linux-x64-cuda
+          zip whisper-cpp-linux-x64-cuda.zip whisper-cpp-linux-x64-cuda libcudart.so.12 libcublas.so.12 libcublasLt.so.12 CUDA-12.9-LICENSE.txt
+          zip whisper-server-linux-x64-cuda.zip whisper-server-linux-x64-cuda libcudart.so.12 libcublas.so.12 libcublasLt.so.12 CUDA-12.9-LICENSE.txt
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -683,7 +706,7 @@ jobs:
             ## GPU Acceleration
             - **macOS ARM64**: Metal GPU acceleration (M1/M2/M3/M4)
             - **Windows x64**: NVIDIA CUDA build (bundled DLLs), Vulkan build (any Vulkan-capable GPU), and CPU build
-            - **Linux x64**: NVIDIA CUDA build (requires system CUDA), Vulkan build (any Vulkan-capable GPU), and CPU build
+            - **Linux x64**: NVIDIA CUDA build (current compatible NVIDIA driver; CUDA libraries bundled), Vulkan build (AMD, Intel, or NVIDIA), and CPU build
             - **macOS x64**: CPU only (Intel Macs, requires macOS 13.3+)
 
             ## whisper-cli binaries
@@ -692,7 +715,7 @@ jobs:
             - `whisper-cpp-win32-x64-cpu.zip` - Windows x64 CPU-only
             - `whisper-cpp-win32-x64-cuda.zip` - Windows x64 with CUDA (includes bundled CUDA DLLs)
             - `whisper-cpp-linux-x64-cpu.zip` - Linux x64 CPU-only
-            - `whisper-cpp-linux-x64-cuda.zip` - Linux x64 with CUDA
+            - `whisper-cpp-linux-x64-cuda.zip` - Linux x64 with CUDA (current compatible NVIDIA driver; CUDA Toolkit not required)
 
             ## whisper-server binaries
             - `whisper-server-darwin-arm64.zip` - macOS Apple Silicon with Metal
@@ -701,14 +724,14 @@ jobs:
             - `whisper-server-win32-x64-cuda.zip` - Windows x64 with CUDA (includes bundled CUDA DLLs)
             - `whisper-server-win32-x64-vulkan.zip` - Windows x64 with Vulkan (uses system Vulkan loader)
             - `whisper-server-linux-x64-cpu.zip` - Linux x64 CPU-only
-            - `whisper-server-linux-x64-cuda.zip` - Linux x64 with CUDA
+            - `whisper-server-linux-x64-cuda.zip` - Linux x64 with CUDA (current compatible NVIDIA driver; CUDA Toolkit not required)
             - `whisper-server-linux-x64-vulkan.zip` - Linux x64 with Vulkan (uses system Vulkan loader)
 
             ## Requirements
-            - **Windows CUDA build**: No additional requirements - CUDA DLLs are bundled.
+            - **Windows CUDA build**: Requires an NVIDIA GPU with a current driver; CUDA DLLs are bundled and the CUDA Toolkit is not required.
             - **Windows Vulkan build**: Requires an up-to-date GPU driver that ships the Vulkan runtime (`vulkan-1.dll`). All modern NVIDIA/AMD/Intel drivers include it.
             - **Windows CPU build**: No requirements.
-            - **Linux CUDA build**: Install latest NVIDIA drivers and CUDA toolkit for GPU acceleration.
+            - **Linux CUDA build**: Requires an NVIDIA GPU with a current compatible driver; CUDA libraries are bundled and the CUDA Toolkit is not required.
             - **Linux Vulkan build**: Requires the system Vulkan loader (`libvulkan.so.1`, typically from the `libvulkan1` package) and a Vulkan-capable GPU driver (Mesa for AMD/Intel, NVIDIA proprietary driver for NVIDIA).
             - **Linux CPU build**: No requirements.
             - **All other platforms**: No requirements.
