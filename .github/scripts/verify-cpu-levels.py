@@ -18,6 +18,10 @@ variants:
    emulator enforces the level, and that the primary dies before serving, which
    OpenWhispr's fallback relies on. It rests on ggml's startup code happening to
    run a BMI2 instruction, so a ggml update that moves it fails this check.
+   Caveat: QEMU gates SHLX/SHRX on BMI1, not BMI2, and its Piledriver model
+   (Opteron_G5) also lacks the BMI1 a real FX has. It matches real hardware only
+   while the primary's startup code runs no BMI1 instruction (true today: GCC
+   builds it with -mbmi2 but not -mbmi).
 3. Each level build is stopped at startup by its level check
    (OPENWHISPR_CPU_LEVEL_CHECK, examples/server/cpu-level-check.cpp) on the
    processor below it: ivybridge on a Sandy Bridge, which lacks F16C, and
@@ -145,8 +149,9 @@ def fetch(name, work):
                 part.replace(dest)
                 return dest
             print(f"  sha256 {actual}, expected {expected}", flush=True)
-        time.sleep(10 * attempt)
-    raise SystemExit(f"{dest.name}: no download matched sha256 {expected}")
+        if attempt < DOWNLOAD_ATTEMPTS:
+            time.sleep(10 * attempt)
+    raise RuntimeError(f"{dest.name}: no download matched sha256 {expected}")
 
 
 def extract(archive, dest):

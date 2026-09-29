@@ -1032,7 +1032,7 @@ jobs:
             - `whisper-server-win32-x64-cpu-sandybridge.zip`, `whisper-server-linux-x64-cpu-sandybridge.zip` - CPU-only, for processors with AVX but no F16C (e.g. 2nd-gen Intel Core; AMD Bulldozer)
 
             ## CPU requirements (x64)
-            - Every x64 build without a level suffix needs AVX2, FMA, F16C and BMI2: most Intel Core processors from Haswell (4th gen) on and AMD from Excavator on; not Intel Pentium, Celeron or Atom models before about 2020, which lack AVX.
+            - Every x64 build without a level suffix needs AVX2, FMA, F16C and BMI2: most Intel Core processors from Haswell (4th gen) on and AMD from Excavator on; not Intel Pentium, Celeron and Atom models without AVX, which includes most made before 2021–2023.
             - `-ivybridge` builds need SSE4.2, AVX and F16C. `-sandybridge` builds need SSE4.2 and AVX. Both stop at startup with an illegal-instruction fault on a processor that lacks them.
 
             ## Requirements
