@@ -10,9 +10,21 @@ on:
   push:
     tags:
       - 'openwhispr-*'
+  # Every PR proves the CPU binaries before a release: it builds them and runs
+  # verify-cpu-levels. The GPU and macOS builds and the release skip
+  # pull_request runs (see their `if:`).
+  pull_request:
+    branches: [master]
 
+# A newer push to a PR supersedes its running check; tag and dispatch runs never
+# share a group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only by default. Only create-release writes (it publishes the release).
 permissions:
-  contents: write
+  contents: read
 
 env:
   # GTX 10 series through RTX 50 (Pascal through Blackwell). sm_120 requires
@@ -23,6 +35,7 @@ env:
 
 jobs:
   build-macos-arm64:
+    if: github.event_name != 'pull_request'
     runs-on: macos-14  # M1 runner
     steps:
       - name: Checkout
@@ -81,6 +94,7 @@ jobs:
           path: dist/whisper-server-darwin-arm64.zip
 
   build-macos-x64:
+    if: github.event_name != 'pull_request'
     runs-on: macos-14  # Cross-compile for x64 on arm64 runner
     steps:
       - name: Checkout
@@ -178,12 +192,95 @@ jobs:
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
 
+      # The build above needs AVX2, FMA, F16C and BMI2 (GGML_NATIVE=OFF turns them
+      # all on) and dies at startup with STATUS_ILLEGAL_INSTRUCTION on Intel before
+      # Haswell and on AMD FX (OpenWhispr/openwhispr#2356). These two whisper-server
+      # builds use upstream ggml's ivybridge (SSE4.2 + AVX + F16C) and sandybridge
+      # (SSE4.2 + AVX) CPU levels; OpenWhispr falls back through them in that order.
+      # OPENWHISPR_CPU_LEVEL_CHECK makes each stop at startup on a processor below its
+      # level (examples/server/cpu-level-check.cpp): ggml alone would start and only
+      # fault at the first transcription, which OpenWhispr's fallback cannot see.
+      - name: Build whisper-server for Ivy Bridge-level processors
+        shell: cmd
+        env:
+          # MSVC has no switch for F16C without AVX2, which is why upstream ggml has
+          # no ivybridge variant on MSVC. Defining the macro turns on ggml's F16C code,
+          # which MSVC compiles from intrinsics under /arch:AVX. CMake reads CFLAGS and
+          # CXXFLAGS only when it first configures a build tree.
+          CFLAGS: /D__F16C__
+          CXXFLAGS: /D__F16C__
+        run: |
+          cmake -S . -B build-ivybridge -G "Ninja Multi-Config" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_AVX=ON ^
+            -DGGML_AVX2=OFF ^
+            -DGGML_BMI2=OFF ^
+            -DGGML_AVX512=OFF ^
+            -DGGML_AVX_VNNI=OFF ^
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
+          cmake --build build-ivybridge --config Release --target whisper-server -j %NUMBER_OF_PROCESSORS%
+
+      - name: Build whisper-server for Sandy Bridge-level processors
+        shell: cmd
+        run: |
+          cmake -S . -B build-sandybridge -G "Ninja Multi-Config" ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=OFF ^
+            -DGGML_AVX=ON ^
+            -DGGML_AVX2=OFF ^
+            -DGGML_BMI2=OFF ^
+            -DGGML_AVX512=OFF ^
+            -DGGML_AVX_VNNI=OFF ^
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
+          cmake --build build-sandybridge --config Release --target whisper-server -j %NUMBER_OF_PROCESSORS%
+
+      - name: Check each build's CPU level
+        # Whole lines: "/arch:AVX GGML_AVX" is also the start of what a missing
+        # GGML_BMI2=OFF produces ("/arch:AVX GGML_AVX;__BMI2__;GGML_BMI2"). Configuring
+        # a configured tree again prints the line without rebuilding. MSVC prints the
+        # same line for both levels, so F16C is checked in the cache here (ggml's F16C
+        # code is in both C and C++ files) and in the binary's own report by
+        # .github/scripts/verify-cpu-levels.py.
+        shell: pwsh
+        run: |
+          function Assert-CpuVariant([string]$BuildDir, [string]$Expected) {
+            $found = @(cmake -S . -B $BuildDir | Where-Object { $_ -like '-- Adding CPU backend variant *' })
+            if ($LASTEXITCODE -ne 0) { throw "configuring $BuildDir failed" }
+            Write-Host "${BuildDir}: $($found -join ' | ')"
+            if ($found.Count -ne 1 -or $found[0] -cne $Expected) { throw "${BuildDir}: expected '$Expected'" }
+          }
+          function Assert-F16cDefine([string]$BuildDir, [bool]$Expected) {
+            foreach ($flags in @("CMAKE_C_FLAGS", "CMAKE_CXX_FLAGS")) {
+              $found = [bool](Select-String -Path "$BuildDir\CMakeCache.txt" -Pattern "^${flags}:STRING=.*/D__F16C__" -Quiet)
+              if ($found -ne $Expected) { throw "${BuildDir}: /D__F16C__ in $flags is $found, expected $Expected" }
+            }
+          }
+          Assert-CpuVariant build '-- Adding CPU backend variant ggml-cpu: /arch:AVX2 GGML_AVX2;GGML_FMA;GGML_F16C;__BMI2__;GGML_BMI2'
+          Assert-CpuVariant build-ivybridge '-- Adding CPU backend variant ggml-cpu: /arch:AVX GGML_AVX'
+          Assert-CpuVariant build-sandybridge '-- Adding CPU backend variant ggml-cpu: /arch:AVX GGML_AVX'
+          Assert-F16cDefine build-ivybridge $true
+          Assert-F16cDefine build-sandybridge $false
+
       - name: Package binaries
         shell: pwsh
         run: |
           mkdir dist
           Copy-Item build\bin\Release\whisper-cli.exe dist\whisper-cpp-win32-x64-cpu.exe
           Copy-Item build\bin\Release\whisper-server.exe dist\whisper-server-win32-x64-cpu.exe
+          foreach ($level in @("ivybridge", "sandybridge")) {
+            Copy-Item "build-$level\bin\Release\whisper-server.exe" "dist\whisper-server-win32-x64-cpu-$level.exe"
+          }
 
           # Both exes link the dynamic MSVC runtime: CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           # is a silent no-op while CMake policy CMP0091 is unset, and MSVC OpenMP links
@@ -201,6 +298,9 @@ jobs:
           Set-Location dist
           Compress-Archive -Path (@("whisper-cpp-win32-x64-cpu.exe") + $runtimeDlls) -DestinationPath whisper-cpp-win32-x64-cpu.zip
           Compress-Archive -Path (@("whisper-server-win32-x64-cpu.exe") + $runtimeDlls) -DestinationPath whisper-server-win32-x64-cpu.zip
+          foreach ($level in @("ivybridge", "sandybridge")) {
+            Compress-Archive -Path (@("whisper-server-win32-x64-cpu-$level.exe") + $runtimeDlls) -DestinationPath "whisper-server-win32-x64-cpu-$level.zip"
+          }
 
       - name: Verify zips contain the MSVC runtime DLLs
         shell: pwsh
@@ -228,7 +328,20 @@ jobs:
           name: whisper-server-win32-x64-cpu
           path: dist/whisper-server-win32-x64-cpu.zip
 
+      - name: Upload whisper-server Ivy Bridge-level artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-win32-x64-cpu-ivybridge
+          path: dist/whisper-server-win32-x64-cpu-ivybridge.zip
+
+      - name: Upload whisper-server Sandy Bridge-level artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-win32-x64-cpu-sandybridge
+          path: dist/whisper-server-win32-x64-cpu-sandybridge.zip
+
   build-windows-x64-cuda:
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     steps:
       - name: Free up disk space
@@ -437,6 +550,57 @@ jobs:
             -DGGML_CUDA=OFF
           cmake --build build --config Release -j $(nproc)
 
+      # The ivybridge and sandybridge whisper-server builds for processors without
+      # AVX2; see the Windows CPU job. GCC switches F16C and FMA separately, so both
+      # are set explicitly.
+      - name: Build whisper-server for Ivy Bridge-level processors
+        run: |
+          cmake -B build-ivybridge \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_SSE42=ON \
+            -DGGML_AVX=ON \
+            -DGGML_F16C=ON \
+            -DGGML_FMA=OFF \
+            -DGGML_BMI2=OFF \
+            -DGGML_AVX2=OFF \
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON
+          cmake --build build-ivybridge --config Release --target whisper-server -j $(nproc)
+
+      - name: Build whisper-server for Sandy Bridge-level processors
+        run: |
+          cmake -B build-sandybridge \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_SSE42=ON \
+            -DGGML_AVX=ON \
+            -DGGML_F16C=OFF \
+            -DGGML_FMA=OFF \
+            -DGGML_BMI2=OFF \
+            -DGGML_AVX2=OFF \
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON
+          cmake --build build-sandybridge --config Release --target whisper-server -j $(nproc)
+
+      - name: Check each build's CPU level
+        # Whole lines, not substrings; see the Windows CPU job
+        run: |
+          check() {
+            found=$(cmake -S . -B "$1" | grep -- '^-- Adding CPU backend variant ' || true)
+            echo "$1: $found"
+            [ "$found" = "$2" ] || { echo "::error::$1: expected '$2'"; exit 1; }
+          }
+          check build '-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mfma;-mbmi2;-mavx;-mavx2 GGML_SSE42;GGML_F16C;GGML_FMA;GGML_BMI2;GGML_AVX;GGML_AVX2'
+          check build-ivybridge '-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mavx GGML_SSE42;GGML_F16C;GGML_AVX'
+          check build-sandybridge '-- Adding CPU backend variant ggml-cpu: -msse4.2;-mavx GGML_SSE42;GGML_AVX'
+
       - name: Package binaries
         run: |
           mkdir -p dist
@@ -444,9 +608,16 @@ jobs:
           chmod +x dist/whisper-cpp-linux-x64-cpu
           cp build/bin/whisper-server dist/whisper-server-linux-x64-cpu
           chmod +x dist/whisper-server-linux-x64-cpu
+          for level in ivybridge sandybridge; do
+            cp "build-$level/bin/whisper-server" "dist/whisper-server-linux-x64-cpu-$level"
+            chmod +x "dist/whisper-server-linux-x64-cpu-$level"
+          done
           cd dist
           zip whisper-cpp-linux-x64-cpu.zip whisper-cpp-linux-x64-cpu
           zip whisper-server-linux-x64-cpu.zip whisper-server-linux-x64-cpu
+          for level in ivybridge sandybridge; do
+            zip "whisper-server-linux-x64-cpu-$level.zip" "whisper-server-linux-x64-cpu-$level"
+          done
 
       - name: Upload whisper-cli artifact
         uses: actions/upload-artifact@v4
@@ -460,7 +631,20 @@ jobs:
           name: whisper-server-linux-x64-cpu
           path: dist/whisper-server-linux-x64-cpu.zip
 
+      - name: Upload whisper-server Ivy Bridge-level artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-linux-x64-cpu-ivybridge
+          path: dist/whisper-server-linux-x64-cpu-ivybridge.zip
+
+      - name: Upload whisper-server Sandy Bridge-level artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-server-linux-x64-cpu-sandybridge
+          path: dist/whisper-server-linux-x64-cpu-sandybridge.zip
+
   build-linux-x64-cuda:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     steps:
       - name: Free up disk space
@@ -544,6 +728,7 @@ jobs:
           path: dist/whisper-server-linux-x64-cuda.zip
 
   build-linux-x64-vulkan:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     steps:
       - name: Free up disk space
@@ -610,6 +795,7 @@ jobs:
           path: dist/whisper-server-linux-x64-vulkan.zip
 
   build-windows-x64-vulkan:
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     steps:
       - name: Free up disk space
@@ -708,9 +894,71 @@ jobs:
           name: whisper-server-win32-x64-vulkan
           path: dist/whisper-server-win32-x64-vulkan.zip
 
+  verify-cpu-levels:
+    # Runs the ivybridge and sandybridge builds on emulated processors of exactly
+    # those levels and checks the next build up is stopped at startup there. See
+    # .github/scripts/verify-cpu-levels.py. create-release waits for this.
+    needs: [build-windows-x64-cpu, build-linux-x64-cpu]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32
+            os: windows-2022
+            emulator: sde
+          - platform: linux
+            # QEMU emulates AVX from 7.2 on; ubuntu-22.04 ships 6.2
+            os: ubuntu-24.04
+            emulator: qemu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install QEMU user-mode emulation
+        if: matrix.emulator == 'qemu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          qemu-x86_64 --version
+
+      - name: Download the CPU builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: whisper-server-${{ matrix.platform }}-x64-cpu*
+          path: artifacts
+
+      - name: Run each build on its emulated processor
+        shell: bash
+        run: |
+          base="artifacts/whisper-server-${{ matrix.platform }}-x64-cpu"
+          python .github/scripts/verify-cpu-levels.py \
+            --emulator ${{ matrix.emulator }} \
+            --primary-zip "$base/whisper-server-${{ matrix.platform }}-x64-cpu.zip" \
+            --ivybridge-zip "$base-ivybridge/whisper-server-${{ matrix.platform }}-x64-cpu-ivybridge.zip" \
+            --sandybridge-zip "$base-sandybridge/whisper-server-${{ matrix.platform }}-x64-cpu-sandybridge.zip" \
+            --with-llama-libraries \
+            --work "$RUNNER_TEMP/verify-cpu-levels"
+
+      - name: Upload the server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-cpu-levels-${{ matrix.platform }}-logs
+          path: ${{ runner.temp }}/verify-cpu-levels/*.log
+
   create-release:
-    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-windows-x64-vulkan, build-linux-x64-cpu, build-linux-x64-cuda, build-linux-x64-vulkan]
+    if: github.event_name != 'pull_request'
+    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-windows-x64-vulkan, build-linux-x64-cpu, build-linux-x64-cuda, build-linux-x64-vulkan, verify-cpu-levels]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -734,6 +982,10 @@ jobs:
           mv artifacts/whisper-server-linux-x64-cuda/whisper-server-linux-x64-cuda.zip release/
           mv artifacts/whisper-server-win32-x64-vulkan/whisper-server-win32-x64-vulkan.zip release/
           mv artifacts/whisper-server-linux-x64-vulkan/whisper-server-linux-x64-vulkan.zip release/
+          for level in ivybridge sandybridge; do
+            mv "artifacts/whisper-server-win32-x64-cpu-$level/whisper-server-win32-x64-cpu-$level.zip" release/
+            mv "artifacts/whisper-server-linux-x64-cpu-$level/whisper-server-linux-x64-cpu-$level.zip" release/
+          done
           ls -la release/
 
       - name: Determine version
@@ -776,15 +1028,21 @@ jobs:
             - `whisper-server-linux-x64-cpu.zip` - Linux x64 CPU-only
             - `whisper-server-linux-x64-cuda.zip` - Linux x64 with CUDA
             - `whisper-server-linux-x64-vulkan.zip` - Linux x64 with Vulkan (uses system Vulkan loader)
+            - `whisper-server-win32-x64-cpu-ivybridge.zip`, `whisper-server-linux-x64-cpu-ivybridge.zip` - CPU-only, for processors with AVX and F16C but no AVX2 (e.g. 3rd-gen Intel Core; AMD Piledriver, Steamroller, Jaguar)
+            - `whisper-server-win32-x64-cpu-sandybridge.zip`, `whisper-server-linux-x64-cpu-sandybridge.zip` - CPU-only, for processors with AVX but no F16C (e.g. 2nd-gen Intel Core; AMD Bulldozer)
+
+            ## CPU requirements (x64)
+            - Every x64 build without a level suffix needs AVX2, FMA, F16C and BMI2: most Intel Core processors from Haswell (4th gen) on and AMD from Excavator on; not Intel Pentium, Celeron and Atom models without AVX, which includes most made before 2021–2023.
+            - `-ivybridge` builds need SSE4.2, AVX and F16C. `-sandybridge` builds need SSE4.2 and AVX. Both stop at startup with an illegal-instruction fault on a processor that lacks them.
 
             ## Requirements
             - **Windows CUDA build**: No additional requirements - CUDA and MSVC runtime DLLs are bundled.
             - **Windows Vulkan build**: Requires an up-to-date GPU driver that ships the Vulkan runtime (`vulkan-1.dll`). All modern NVIDIA/AMD/Intel drivers include it. MSVC runtime DLLs are bundled.
-            - **Windows CPU build**: No requirements - MSVC runtime DLLs are bundled.
+            - **Windows CPU builds**: No software requirements - MSVC runtime DLLs are bundled. See CPU requirements.
             - **Linux CUDA build**: Install latest NVIDIA drivers and CUDA toolkit for GPU acceleration.
             - **Linux Vulkan build**: Requires the system Vulkan loader (`libvulkan.so.1`, typically from the `libvulkan1` package) and a Vulkan-capable GPU driver (Mesa for AMD/Intel, NVIDIA proprietary driver for NVIDIA).
-            - **Linux CPU build**: No requirements.
-            - **All other platforms**: No requirements.
+            - **Linux CPU builds**: No software requirements. See CPU requirements.
+            - **All other platforms**: No software requirements.
 
             ## Supported NVIDIA GPUs (CUDA builds)
             Compute capabilities 6.1+ (GTX 10 series and newer)
