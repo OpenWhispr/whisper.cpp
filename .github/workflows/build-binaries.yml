@@ -884,9 +884,68 @@ jobs:
           name: whisper-server-win32-x64-vulkan
           path: dist/whisper-server-win32-x64-vulkan.zip
 
+  verify-cpu-levels:
+    # Runs the ivybridge and sandybridge builds on emulated processors of exactly
+    # those levels and checks the next build up is stopped at startup there. See
+    # .github/scripts/verify-cpu-levels.py. create-release waits for this.
+    needs: [build-windows-x64-cpu, build-linux-x64-cpu]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32
+            os: windows-2022
+            emulator: sde
+          - platform: linux
+            # QEMU emulates AVX from 7.2 on; ubuntu-22.04 ships 6.2
+            os: ubuntu-24.04
+            emulator: qemu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install QEMU user-mode emulation
+        if: matrix.emulator == 'qemu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          qemu-x86_64 --version
+
+      - name: Download the CPU builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: whisper-server-${{ matrix.platform }}-x64-cpu*
+          path: artifacts
+
+      - name: Run each build on its emulated processor
+        shell: bash
+        run: |
+          base="artifacts/whisper-server-${{ matrix.platform }}-x64-cpu"
+          python .github/scripts/verify-cpu-levels.py \
+            --emulator ${{ matrix.emulator }} \
+            --primary-zip "$base/whisper-server-${{ matrix.platform }}-x64-cpu.zip" \
+            --ivybridge-zip "$base-ivybridge/whisper-server-${{ matrix.platform }}-x64-cpu-ivybridge.zip" \
+            --sandybridge-zip "$base-sandybridge/whisper-server-${{ matrix.platform }}-x64-cpu-sandybridge.zip" \
+            --with-llama-libraries \
+            --work "$RUNNER_TEMP/verify-cpu-levels"
+
+      - name: Upload the server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-cpu-levels-${{ matrix.platform }}-logs
+          path: ${{ runner.temp }}/verify-cpu-levels/*.log
+
   create-release:
     if: github.event_name != 'pull_request'
-    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-windows-x64-vulkan, build-linux-x64-cpu, build-linux-x64-cuda, build-linux-x64-vulkan]
+    needs: [build-macos-arm64, build-macos-x64, build-windows-x64-cpu, build-windows-x64-cuda, build-windows-x64-vulkan, build-linux-x64-cpu, build-linux-x64-cuda, build-linux-x64-vulkan, verify-cpu-levels]
     runs-on: ubuntu-latest
     permissions:
       contents: write
