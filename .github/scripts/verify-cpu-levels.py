@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
 """Check whisper-server's builds for processors without AVX2 (OpenWhispr/openwhispr#2356).
 
-Each build runs under an emulator that implements only its CPU level: Intel SDE
-(-ivb, -snb) on Windows, QEMU user mode (-cpu IvyBridge, -cpu SandyBridge) on
-Linux. The levels are upstream ggml's CPU variants:
+Each build runs under an emulator that implements only a chosen processor: Intel
+SDE on Windows, QEMU user mode on Linux. The levels are upstream ggml's CPU
+variants:
 
   ivybridge    SSE4.2 + AVX + F16C (Intel Ivy Bridge, AMD Piledriver, Jaguar)
   sandybridge  SSE4.2 + AVX        (Intel Sandy Bridge, AMD Bulldozer)
 
-1. Each build starts the way OpenWhispr starts it (a real model, Silero VAD on),
-   transcribes samples/jfk.wav, and reports exactly its level's instruction sets.
-2. The next build up must be stopped before it starts serving: the primary
-   (AVX2) build on Ivy Bridge, where ggml's startup code faults, and the
-   ivybridge build on Sandy Bridge, where its level check (OPENWHISPR_CPU_LEVEL_CHECK,
-   examples/server/cpu-level-check.cpp) refuses: ggml alone only reaches F16C at
-   the first transcription. That proves the emulator enforces the level, so check
-   1 means something, and it proves what OpenWhispr's fallback relies on: a build
-   dies at startup on a processor it does not support, not mid-transcription.
+1. Each level build starts the way OpenWhispr starts it (a real model, Silero
+   VAD on), transcribes samples/jfk.wav on its own level, and its system_info
+   reports exactly its level's instruction sets, so a build compiled above its
+   level fails here even if the emulator never ran the offending code.
+2. The primary (AVX2) build is stopped at startup by the emulator itself on an
+   Ivy Bridge (SDE's chip check, or SIGILL under QEMU) and, under QEMU, on a
+   Piledriver-class AMD FX (AVX, F16C and FMA, no AVX2 or BMI2). That proves the
+   emulator enforces the level, and that the primary dies before serving, which
+   OpenWhispr's fallback relies on. It rests on ggml's startup code happening to
+   run a BMI2 instruction, so a ggml update that moves it fails this check.
+3. Each level build is stopped at startup by its level check
+   (OPENWHISPR_CPU_LEVEL_CHECK, examples/server/cpu-level-check.cpp) on the
+   processor below it: ivybridge on a Sandy Bridge, which lacks F16C, and
+   sandybridge on a Westmere, which lacks AVX. ggml alone would start there and
+   only fault at the first transcription.
 
---with-llama-libraries also starts each build on its own level with llama.cpp's
-libraries beside it, as in OpenWhispr's resources/bin: whisper-server loads
-every ggml library in its folder at startup (ggml_backend_load_all).
+--with-llama-libraries also starts each level build on its own level with
+llama.cpp's libraries beside it, as in OpenWhispr's resources/bin: whisper-server
+loads every ggml library in its folder at startup (ggml_backend_load_all).
 
---emulator none runs everything natively. It exists to smoke-test this script
-locally and can never pass: nothing stops the rejection checks.
+Each result prints as soon as its check finishes; an error inside a check is a
+FAIL line, not a traceback. --emulator none runs everything natively. It exists
+to smoke-test this script locally and can never pass: nothing stops the
+rejection checks.
 """
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -79,23 +88,33 @@ DOWNLOADS = {
         "4bd11fe0cea35223b240496062900ed9493b46f20a08747d431bfdc2252af2d8",
     ),
 }
+DOWNLOAD_ATTEMPTS = 3
 
+# The emulators' names for each processor. SDE emulates Intel chips only.
 EMULATED_CPUS = {
     "ivybridge": {"sde": "-ivb", "qemu": "IvyBridge"},
     "sandybridge": {"sde": "-snb", "qemu": "SandyBridge"},
+    "piledriver": {"qemu": "Opteron_G5"},
+    "westmere": {"sde": "-wsm", "qemu": "Westmere"},
 }
-# What each build's system_info line must report, among the instruction sets that matter here
+# The instruction sets each level build's system_info must report
 EXPECTED_FEATURES = {"ivybridge": {"AVX", "F16C"}, "sandybridge": {"AVX"}}
-CHECKED_FEATURES = {"AVX", "AVX2", "F16C", "FMA", "BMI2", "AVX512"}
+# system_info names that are x86 instruction set extensions above SSE4.2
+ISA_FEATURE = re.compile(r"^(AVX\w*|AMX\w*|F16C|FMA|BMI2)$")
 # The libraries OpenWhispr copies out of the llama.cpp archive (copyLibraries there)
 LIBRARY = re.compile(r"\.(dll|so(\.\d+)*)$")
 
 SDE_VIOLATION = re.compile(r"SDE-ERROR:.*not valid for specified chip.*", re.IGNORECASE)
 # What cpu-level-check.cpp prints before it raises the fault
-LEVEL_CHECK = re.compile(r"whisper-server: built for \w+, which this processor does not support")
+LEVEL_CHECK = re.compile(r"whisper-server: built for (\w+), which this processor does not support")
 STATUS_ILLEGAL_INSTRUCTION = 0xC000001D
-READY_TIMEOUT_S = 900
-INFERENCE_TIMEOUT_S = 2700
+# Observed on GitHub's runners: SDE runs every check in about a minute; under
+# QEMU a start takes well under a minute and the slowest transcription ~7 min.
+READY_TIMEOUT_S = 300
+INFERENCE_TIMEOUT_S = 1500
+
+# Talk to the local server directly, whatever proxy the environment configures
+LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def sha256_of(path):
@@ -107,16 +126,27 @@ def sha256_of(path):
 
 
 def fetch(name, work):
+    """Download a pinned file, retrying a failed or corrupt transfer."""
     url, expected = DOWNLOADS[name]
     dest = work / url.rsplit("/", 1)[-1]
-    if not dest.exists() or sha256_of(dest) != expected:
-        print(f"Downloading {url}", flush=True)
-        with urllib.request.urlopen(url, timeout=120) as response, open(dest, "wb") as out:
-            shutil.copyfileobj(response, out)
-    actual = sha256_of(dest)
-    if actual != expected:
-        raise SystemExit(f"{dest.name}: sha256 {actual}, expected {expected}")
-    return dest
+    if dest.exists() and sha256_of(dest) == expected:
+        return dest
+    part = dest.with_name(dest.name + ".part")
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        print(f"Downloading {url} (attempt {attempt})", flush=True)
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response, open(part, "wb") as out:
+                shutil.copyfileobj(response, out)
+        except (OSError, http.client.HTTPException) as error:
+            print(f"  failed: {error}", flush=True)
+        else:
+            actual = sha256_of(part)
+            if actual == expected:
+                part.replace(dest)
+                return dest
+            print(f"  sha256 {actual}, expected {expected}", flush=True)
+        time.sleep(10 * attempt)
+    raise SystemExit(f"{dest.name}: no download matched sha256 {expected}")
 
 
 def extract(archive, dest):
@@ -193,17 +223,21 @@ def start_server(prefix, cwd, server, model, vad_model, log_path):
 
 
 def wait_ready(proc, port):
+    """Wait until the server answers HTTP. Any answer counts, as OpenWhispr's
+    health check treats it, but only while the process it started is alive."""
     deadline = time.monotonic() + READY_TIMEOUT_S
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5):
-                return True
+            with LOCAL.open(f"http://127.0.0.1:{port}/", timeout=5):
+                pass
         except urllib.error.HTTPError:
-            return True  # any HTTP answer means it is up, as OpenWhispr's health check treats it
-        except OSError:
+            pass
+        except (OSError, http.client.HTTPException):
             time.sleep(1)
+            continue
+        return proc.poll() is None
     return False
 
 
@@ -231,7 +265,7 @@ def transcribe(port):
         data=b"".join(parts),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    with urllib.request.urlopen(request, timeout=INFERENCE_TIMEOUT_S) as response:
+    with LOCAL.open(request, timeout=INFERENCE_TIMEOUT_S) as response:
         return json.loads(response.read())["text"]
 
 
@@ -262,16 +296,16 @@ def violation(kind, returncode, output):
     )
     if not illegal:
         return None
-    refusals = LEVEL_CHECK.findall(output)
+    refusals = [m.group(0) for m in LEVEL_CHECK.finditer(output)]
     return "; ".join(refusals) if refusals else "killed by an illegal instruction"
 
 
 def reported_features(output):
-    """Instruction sets the build says it was compiled for (its system_info line)."""
+    """Instruction sets above SSE4.2 the build says it was compiled for (system_info)."""
     for line in output.splitlines():
         if line.startswith("system_info:") and "CPU :" in line:
             enabled = re.findall(r"(\w+) = 1", line.split("CPU :", 1)[1])
-            return set(enabled) & CHECKED_FEATURES
+            return {name for name in enabled if ISA_FEATURE.match(name)}
     return None
 
 
@@ -279,30 +313,39 @@ def words(text):
     return " ".join(re.sub(r"[^a-z]+", " ", text.lower()).split())
 
 
-def run(kind, level, server, model, vad_model, work, label, transcribe_audio):
-    """Start `server` on an emulated `level` processor. Returns (ready, text, output, returncode)."""
-    prefix, cwd = emulator(kind, level, work)
+def run(kind, cpu, server, model, vad_model, work, label, transcribe_audio):
+    """Start `server` on an emulated `cpu`, optionally transcribe, and stop it.
+    Returns (ready, text, request_error, output, returncode)."""
+    prefix, cwd = emulator(kind, cpu, work)
     log_path = work / f"{label.replace(' ', '-')}.log"
     proc, log, port = start_server(prefix, cwd, server, model, vad_model, log_path)
-    ready, text = False, None
+    ready, text, request_error = False, None, None
     try:
         ready = wait_ready(proc, port)
         if ready and transcribe_audio:
-            text = transcribe(port)
+            try:
+                text = transcribe(port)
+            except (OSError, http.client.HTTPException, ValueError, KeyError) as error:
+                # e.g. the server dying mid-request: its exit code tells why
+                request_error = f"{type(error).__name__}: {error}"
     finally:
         stop(proc)
         log.close()
-    return ready, text, log_path.read_text(errors="replace"), proc.returncode
+    return ready, text, request_error, log_path.read_text(errors="replace"), proc.returncode
 
 
 def check_transcribes(kind, level, server, model, vad_model, work):
     label = f"{server.name} on {level}"
-    ready, text, output, returncode = run(kind, level, server, model, vad_model, work, label, True)
+    ready, text, request_error, output, returncode = run(
+        kind, level, server, model, vad_model, work, label, True
+    )
     hit = violation(kind, returncode, output)
     if hit:
         return False, f"{label} ran an instruction {level} lacks: {hit}"
-    if not ready or text is None:
+    if not ready:
         return False, f"{label} did not start (exit {returncode}):\n{output[-2000:]}"
+    if text is None:
+        return False, f"{label} failed to transcribe ({request_error}, exit {returncode}):\n{output[-2000:]}"
     if EXPECTED_WORDS not in words(text):
         return False, f"{label} transcribed jfk.wav as {text!r}"
     features = reported_features(output)
@@ -312,26 +355,32 @@ def check_transcribes(kind, level, server, model, vad_model, work):
     return True, f"{label}: transcribed {text.strip()!r}, reports {sorted(features)}"
 
 
-def check_rejected(kind, level, server, model, work, by_level_check):
-    label = f"{server.name} on {level}"
-    ready, _, output, returncode = run(kind, level, server, model, None, work, label, False)
+def check_rejected(kind, cpu, server, model, work, refused_feature=None):
+    """`server` must die at startup on `cpu`: by its level check refusing exactly
+    `refused_feature`, or, when that is None, by the emulator itself."""
+    label = f"{server.name} on {cpu}"
+    ready, _, _, output, returncode = run(kind, cpu, server, model, None, work, label, False)
     if ready:
         return False, (
-            f"{label} started serving. Either the emulator does not enforce {level} (then the "
+            f"{label} started serving. Either the emulator does not enforce {cpu} (then the "
             "transcription checks prove nothing) or the build no longer dies at startup on a "
             "processor it does not support (then OpenWhispr's fallback cannot see the crash)"
         )
     hit = violation(kind, returncode, output)
     if not hit:
         return False, f"{label} exited ({returncode}) without an instruction violation"
-    if by_level_check and not LEVEL_CHECK.search(output):
-        return False, f"{label} was stopped ({hit}), but not by its level check"
+    refused = {m.group(1) for m in LEVEL_CHECK.finditer(output)}
+    if refused_feature is not None and refused != {refused_feature}:
+        return False, f"{label} was stopped ({hit}), expected its level check to refuse {refused_feature}"
+    if refused_feature is None and (refused or (kind == "sde" and not SDE_VIOLATION.search(output))):
+        return False, f"{label} was stopped ({hit}), expected the emulator to stop it"
     return True, f"{label}: stopped at startup as expected ({hit})"
 
 
 def check_starts_with_llama(kind, level, server, model, work):
+    server = with_llama_libraries(server, level, work)
     label = f"{server.name} with llama.cpp libraries on {level}"
-    ready, _, output, returncode = run(kind, level, server, model, None, work, label, False)
+    ready, _, _, output, returncode = run(kind, level, server, model, None, work, label, False)
     hit = violation(kind, returncode, output)
     if hit:
         return False, f"{label} ran an instruction {level} lacks: {hit}"
@@ -354,25 +403,34 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     model, vad_model = fetch("model", work), fetch("vad", work)
     primary = unpack_server(args.primary_zip.resolve(), work / "primary")
-    levels = {
-        "ivybridge": unpack_server(args.ivybridge_zip.resolve(), work / "ivybridge"),
-        "sandybridge": unpack_server(args.sandybridge_zip.resolve(), work / "sandybridge"),
-    }
+    ivybridge = unpack_server(args.ivybridge_zip.resolve(), work / "ivybridge")
+    sandybridge = unpack_server(args.sandybridge_zip.resolve(), work / "sandybridge")
 
     kind = args.emulator
-    results = [
-        check_transcribes(kind, "ivybridge", levels["ivybridge"], model, vad_model, work),
-        check_transcribes(kind, "sandybridge", levels["sandybridge"], model, vad_model, work),
-        check_rejected(kind, "ivybridge", primary, model, work, by_level_check=False),
-        check_rejected(kind, "sandybridge", levels["ivybridge"], model, work, by_level_check=True),
+    checks = [
+        ("ivybridge transcribes", lambda: check_transcribes(kind, "ivybridge", ivybridge, model, vad_model, work)),
+        ("sandybridge transcribes", lambda: check_transcribes(kind, "sandybridge", sandybridge, model, vad_model, work)),
+        ("primary stopped on ivybridge", lambda: check_rejected(kind, "ivybridge", primary, model, work)),
+        ("ivybridge refused on sandybridge", lambda: check_rejected(kind, "sandybridge", ivybridge, model, work, "F16C")),
+        ("sandybridge refused on westmere", lambda: check_rejected(kind, "westmere", sandybridge, model, work, "AVX")),
     ]
+    if kind != "sde":
+        checks.append(("primary stopped on piledriver", lambda: check_rejected(kind, "piledriver", primary, model, work)))
     if args.with_llama_libraries:
-        for level, server in levels.items():
-            server = with_llama_libraries(server, level, work)
-            results.append(check_starts_with_llama(kind, level, server, model, work))
-    for ok, message in results:
+        checks += [
+            ("ivybridge starts beside llama.cpp", lambda: check_starts_with_llama(kind, "ivybridge", ivybridge, model, work)),
+            ("sandybridge starts beside llama.cpp", lambda: check_starts_with_llama(kind, "sandybridge", sandybridge, model, work)),
+        ]
+
+    passed = True
+    for name, check in checks:
+        try:
+            ok, message = check()
+        except Exception as error:  # a broken check is a failure, not the end of the run
+            ok, message = False, f"{name}: {type(error).__name__}: {error}"
+        passed = passed and ok
         print(f"{'PASS' if ok else 'FAIL'}: {message}", flush=True)
-    sys.exit(0 if all(ok for ok, _ in results) else 1)
+    sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
