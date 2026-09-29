@@ -10,11 +10,13 @@ Linux. The levels are upstream ggml's CPU variants:
 
 1. Each build starts the way OpenWhispr starts it (a real model, Silero VAD on),
    transcribes samples/jfk.wav, and reports exactly its level's instruction sets.
-2. The next build up must be stopped by the same emulator before it starts
-   serving: the primary (AVX2) build on Ivy Bridge, the ivybridge build on Sandy
-   Bridge. That proves the emulator enforces the level, so check 1 means
-   something. It also proves what OpenWhispr's fallback relies on: a build dies
-   at startup on a processor it does not support, not later mid-transcription.
+2. The next build up must be stopped before it starts serving: the primary
+   (AVX2) build on Ivy Bridge, where ggml's startup code faults, and the
+   ivybridge build on Sandy Bridge, where its level check (OPENWHISPR_CPU_LEVEL_CHECK,
+   examples/server/cpu-level-check.cpp) refuses: ggml alone only reaches F16C at
+   the first transcription. That proves the emulator enforces the level, so check
+   1 means something, and it proves what OpenWhispr's fallback relies on: a build
+   dies at startup on a processor it does not support, not mid-transcription.
 
 --with-llama-libraries also starts each build on its own level with llama.cpp's
 libraries beside it, as in OpenWhispr's resources/bin: whisper-server loads
@@ -89,6 +91,9 @@ CHECKED_FEATURES = {"AVX", "AVX2", "F16C", "FMA", "BMI2", "AVX512"}
 LIBRARY = re.compile(r"\.(dll|so(\.\d+)*)$")
 
 SDE_VIOLATION = re.compile(r"SDE-ERROR:.*not valid for specified chip.*", re.IGNORECASE)
+# What cpu-level-check.cpp prints before it raises the fault
+LEVEL_CHECK = re.compile(r"whisper-server: built for \w+, which this processor does not support")
+STATUS_ILLEGAL_INSTRUCTION = 0xC000001D
 READY_TIMEOUT_S = 900
 INFERENCE_TIMEOUT_S = 2700
 
@@ -245,13 +250,20 @@ def stop(proc):
 
 
 def violation(kind, returncode, output):
-    """The emulator's verdict that the program ran an instruction the emulated CPU lacks."""
+    """How the program was stopped for an instruction the emulated CPU lacks: SDE's
+    chip check, or an illegal-instruction death (a real fault, or the one a level
+    check raises after naming what is missing), or None."""
     if kind == "sde":
         match = SDE_VIOLATION.search(output)
-        return match.group(0).strip() if match else None
-    if kind == "qemu" and returncode == -signal.SIGILL:
-        return "killed by SIGILL"
-    return None
+        if match:
+            return match.group(0).strip()
+    illegal = (kind == "sde" and returncode == STATUS_ILLEGAL_INSTRUCTION) or (
+        kind == "qemu" and returncode == -signal.SIGILL
+    )
+    if not illegal:
+        return None
+    refusals = LEVEL_CHECK.findall(output)
+    return "; ".join(refusals) if refusals else "killed by an illegal instruction"
 
 
 def reported_features(output):
@@ -300,7 +312,7 @@ def check_transcribes(kind, level, server, model, vad_model, work):
     return True, f"{label}: transcribed {text.strip()!r}, reports {sorted(features)}"
 
 
-def check_rejected(kind, level, server, model, work):
+def check_rejected(kind, level, server, model, work, by_level_check):
     label = f"{server.name} on {level}"
     ready, _, output, returncode = run(kind, level, server, model, None, work, label, False)
     if ready:
@@ -312,6 +324,8 @@ def check_rejected(kind, level, server, model, work):
     hit = violation(kind, returncode, output)
     if not hit:
         return False, f"{label} exited ({returncode}) without an instruction violation"
+    if by_level_check and not LEVEL_CHECK.search(output):
+        return False, f"{label} was stopped ({hit}), but not by its level check"
     return True, f"{label}: stopped at startup as expected ({hit})"
 
 
@@ -349,8 +363,8 @@ def main():
     results = [
         check_transcribes(kind, "ivybridge", levels["ivybridge"], model, vad_model, work),
         check_transcribes(kind, "sandybridge", levels["sandybridge"], model, vad_model, work),
-        check_rejected(kind, "ivybridge", primary, model, work),
-        check_rejected(kind, "sandybridge", levels["ivybridge"], model, work),
+        check_rejected(kind, "ivybridge", primary, model, work, by_level_check=False),
+        check_rejected(kind, "sandybridge", levels["ivybridge"], model, work, by_level_check=True),
     ]
     if args.with_llama_libraries:
         for level, server in levels.items():

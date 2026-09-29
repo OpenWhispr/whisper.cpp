@@ -194,6 +194,9 @@ jobs:
       # Haswell and on AMD FX (OpenWhispr/openwhispr#2356). These two whisper-server
       # builds use upstream ggml's ivybridge (SSE4.2 + AVX + F16C) and sandybridge
       # (SSE4.2 + AVX) CPU levels; OpenWhispr falls back through them in that order.
+      # OPENWHISPR_CPU_LEVEL_CHECK makes each stop at startup on a processor below its
+      # level (examples/server/cpu-level-check.cpp): ggml alone would start and only
+      # fault at the first transcription, which OpenWhispr's fallback cannot see.
       - name: Build whisper-server for Ivy Bridge-level processors
         shell: cmd
         env:
@@ -216,6 +219,7 @@ jobs:
             -DGGML_BMI2=OFF ^
             -DGGML_AVX512=OFF ^
             -DGGML_AVX_VNNI=OFF ^
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
           cmake --build build-ivybridge --config Release --target whisper-server -j %NUMBER_OF_PROCESSORS%
 
@@ -234,6 +238,7 @@ jobs:
             -DGGML_BMI2=OFF ^
             -DGGML_AVX512=OFF ^
             -DGGML_AVX_VNNI=OFF ^
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded || exit /b 1
           cmake --build build-sandybridge --config Release --target whisper-server -j %NUMBER_OF_PROCESSORS%
 
@@ -559,7 +564,8 @@ jobs:
             -DGGML_F16C=ON \
             -DGGML_FMA=OFF \
             -DGGML_BMI2=OFF \
-            -DGGML_AVX2=OFF
+            -DGGML_AVX2=OFF \
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON
           cmake --build build-ivybridge --config Release --target whisper-server -j $(nproc)
 
       - name: Build whisper-server for Sandy Bridge-level processors
@@ -576,7 +582,8 @@ jobs:
             -DGGML_F16C=OFF \
             -DGGML_FMA=OFF \
             -DGGML_BMI2=OFF \
-            -DGGML_AVX2=OFF
+            -DGGML_AVX2=OFF \
+            -DOPENWHISPR_CPU_LEVEL_CHECK=ON
           cmake --build build-sandybridge --config Release --target whisper-server -j $(nproc)
 
       - name: Check each build's CPU level
